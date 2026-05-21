@@ -51,9 +51,8 @@ subroutine lattice_calculations_gpu
     logical :: overlap
     integer :: imin
 
-    ! Temporary arrays for GPU -> CPU compaction
-    integer, allocatable :: g_valid(:,:,:), he_valid(:,:,:), n_valid(:,:,:)
-    integer :: ng, nhe, nn   ! counters for compaction
+    ! Compaction counters
+    integer :: ng, nhe, nn
 
     write(*,*) "!-------------------------------------------------------!"
     write(*,*) "! GPU-accelerated lattice calculations (OpenACC)         !"
@@ -71,26 +70,21 @@ subroutine lattice_calculations_gpu
     ! Extract cell dimensions
     ell = fcell%ell
 
-    ! Allocate compaction arrays
-    allocate(g_valid(ncubesx, ncubesy, ncubesz))
-    allocate(he_valid(ncubesx, ncubesy, ncubesz))
-    allocate(n_valid(ncubesx, ncubesy, ncubesz))
-    g_valid = 0; he_valid = 0; n_valid = 0
-
     ! Initialize output arrays
     lattice_space = 0; lattice_space_he = 0; lattice_space_n = 0
     lattice_rdist2 = 0.0d0; lattice_lj_he = 0.0d0
-    lattice_index = 0; g_cubes = 0; he_cubes = 0; n_cubes = 0
+    g_cubes = 0; he_cubes = 0; n_cubes = 0
 
     !####################################################################
     ! GPU KERNEL: Parallel over all cubelets
+    ! No compaction arrays — use lattice_space as marker.
+    ! lattice_index computed on CPU after (saves 3 × ntot × 4 bytes VRAM).
     !####################################################################
     !$acc enter data copyin(coords_temp, asigma2, asigma2_he, aeps_he, &
     !$acc&   asigma, asigma2_n, atype, ell, hicut2, cube_size, &
     !$acc&   ncubesx, ncubesy, ncubesz, natoms) &
     !$acc&   create(lattice_space, lattice_rdist2, lattice_space_he, &
-    !$acc&   lattice_space_n, lattice_lj_he, lattice_index, &
-    !$acc&   g_valid, he_valid, n_valid)
+    !$acc&   lattice_space_n, lattice_lj_he)
 
     !$acc parallel loop collapse(3) gang vector &
     !$acc& private(xc, yc, zc, d1, d2, d3, rdist2, rdist2_ref, overlap, &
@@ -100,7 +94,6 @@ subroutine lattice_calculations_gpu
     !$acc& present(coords_temp, asigma2, asigma2_he, aeps_he, asigma, &
     !$acc&   asigma2_n, atype, lattice_space, lattice_rdist2, &
     !$acc&   lattice_space_he, lattice_space_n, lattice_lj_he, &
-    !$acc&   lattice_index, g_valid, he_valid, n_valid, &
     !$acc&   ncubesx, ncubesy, ncubesz)
     do l=1, ncubesz
         do k=1, ncubesy
@@ -111,14 +104,6 @@ subroutine lattice_calculations_gpu
                 yc = dble(k-1)*cube_size + 0.5d0*cube_size
                 zc = dble(l-1)*cube_size + 0.5d0*cube_size
 
-                !--- Cubelet linear index ---
-                icount = (l-1)*ncubesx*ncubesy + (k-1)*ncubesx + j
-
-                !--- Lookup table (all cubelets, not just valid ones) ---
-                lattice_index(1, icount) = j
-                lattice_index(2, icount) = k
-                lattice_index(3, icount) = l
-
                 !--- Initialize per-cubelet accumulators ---
                 overlap = .false.
                 rdist2_ref = huge(0.0d0)
@@ -127,8 +112,6 @@ subroutine lattice_calculations_gpu
                 imin = 1
 
                 !--- Loop over all atoms (sequential per cubelet) ---
-                ! This inner loop is the dominant computational work.
-                ! Coalesced reads: coords_temp(1:3, i) strides by 1 in i.
                 do i=1, natoms
                     ! Minimum-image distance (orthorhombic fast path)
                     d1 = xc - coords_temp(1, i)
@@ -168,6 +151,7 @@ subroutine lattice_calculations_gpu
                 end do  ! i = 1, natoms
 
                 !--- Store LJ energy for this cubelet ---
+                icount = (l-1)*ncubesx*ncubesy + (k-1)*ncubesx + j
                 lattice_lj_he(icount) = lj_local
 
                 !--- Skip if cubelet center overlaps with an atom ---
@@ -177,19 +161,14 @@ subroutine lattice_calculations_gpu
                 lattice_space(j, k, l) = 1
                 lattice_rdist2(j, k, l) = rdist_surface_ref*rdist_surface_ref
 
-                !--- Mark for later compaction ---
-                g_valid(j, k, l) = icount
-
                 !--- Helium accessibility ---
                 if(rdist2_ref > 0.25d0*asigma2_he(atype(imin))) then
                     lattice_space_he(j, k, l) = 1
-                    he_valid(j, k, l) = icount
                 end if
 
                 !--- Nitrogen accessibility ---
                 if(rdist2_ref > asigma2_n(atype(imin))) then
                     lattice_space_n(j, k, l) = 1
-                    n_valid(j, k, l) = icount
                 end if
 
             end do  ! j
@@ -201,27 +180,28 @@ subroutine lattice_calculations_gpu
     ! Data transfer: copy results back from GPU
     !####################################################################
     !$acc exit data copyout(lattice_space, lattice_rdist2, lattice_space_he, &
-    !$acc&   lattice_space_n, lattice_lj_he, lattice_index, &
-    !$acc&   g_valid, he_valid, n_valid)
+    !$acc&   lattice_space_n, lattice_lj_he)
 
     !####################################################################
-    ! CPU compaction: count and fill variable-length arrays
+    ! CPU compaction: use lattice_space markers + recompute icount
+    ! This avoids storing 3 large g_valid/he_valid/n_valid arrays on GPU.
     !####################################################################
     ng = 0; nhe = 0; nn = 0
     do l=1, ncubesz
         do k=1, ncubesy
             do j=1, ncubesx
-                if(g_valid(j,k,l) > 0) then
+                icount = (l-1)*ncubesx*ncubesy + (k-1)*ncubesx + j
+                if(lattice_space(j,k,l) == 1) then
                     ng = ng + 1
-                    g_cubes(ng) = g_valid(j,k,l)
+                    g_cubes(ng) = icount
                 end if
-                if(he_valid(j,k,l) > 0) then
+                if(lattice_space_he(j,k,l) == 1) then
                     nhe = nhe + 1
-                    he_cubes(nhe) = he_valid(j,k,l)
+                    he_cubes(nhe) = icount
                 end if
-                if(n_valid(j,k,l) > 0) then
+                if(lattice_space_n(j,k,l) == 1) then
                     nn = nn + 1
-                    n_cubes(nn) = n_valid(j,k,l)
+                    n_cubes(nn) = icount
                 end if
             end do
         end do
@@ -231,12 +211,19 @@ subroutine lattice_calculations_gpu
     nhe_cubes = nhe
     nn_cubes = nn
 
+    !--- Compute lattice_index on CPU (was done on GPU before, moved to save VRAM) ---
+    do icount = 1, ntot
+        l = (icount - 1) / (ncubesx * ncubesy) + 1
+        k = mod((icount - 1) / ncubesx, ncubesy) + 1
+        j = mod(icount - 1, ncubesx) + 1
+        lattice_index(1, icount) = j
+        lattice_index(2, icount) = k
+        lattice_index(3, icount) = l
+    end do
+
     !--- Allocate percolation arrays ---
     allocate(PA1(ng_cubes), PA2(ng_cubes), PA3(ng_cubes), PA4(ng_cubes))
     PA1 = 0.0d0; PA2 = 0; PA3 = 0; PA4 = 0
-
-    !--- Cleanup ---
-    deallocate(g_valid, he_valid, n_valid)
 
     write(*,'(a,i10)') "  Cubelets accessible to point probe:  ", ng_cubes
     write(*,'(a,i10)') "  Cubelets accessible to helium:       ", nhe_cubes
