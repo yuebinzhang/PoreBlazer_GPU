@@ -1123,7 +1123,7 @@ subroutine pore_distribution
 
         atvec1 = fundcell_unslant(fcell, atvec1)
 
-        write(20,*) "He ", atvec1%comp(1), atvec1%comp(2), atvec1%comp(3)
+        write(20,'(a,3f25.16)') "He ", atvec1%comp(1), atvec1%comp(2), atvec1%comp(3)
     end do
     close(20)
 

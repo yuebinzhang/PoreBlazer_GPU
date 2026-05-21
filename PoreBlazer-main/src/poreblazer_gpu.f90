@@ -214,8 +214,8 @@ subroutine lattice_calculations_gpu
     !--- Compute lattice_index on CPU (was done on GPU before, moved to save VRAM) ---
     do icount = 1, ntot
         l = (icount - 1) / (ncubesx * ncubesy) + 1
-        k = mod((icount - 1) / ncubesx, ncubesy) + 1
-        j = mod(icount - 1, ncubesx) + 1
+        k = modulo((icount - 1) / ncubesx, ncubesy) + 1
+        j = modulo(icount - 1, ncubesx) + 1
         lattice_index(1, icount) = j
         lattice_index(2, icount) = k
         lattice_index(3, icount) = l
