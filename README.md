@@ -12,7 +12,7 @@ GPU-accelerated **[PoreBlazer v4.0](https://github.com/SarkisovGitHub/PoreBlazer
 | Component | Detail |
 |---|---|
 | CPU | 12th Gen Intel (Alder Lake) |
-| GPU | NVIDIA RTX 4000 Ada (CC 8.9, 8 GB VRAM) |
+| GPU | NVIDIA RTX 4000 Ada (CC 8.9, 12 GB VRAM) |
 | Compiler | nvfortran 26.1-0 (NVIDIA HPC SDK) |
 | CUDA | CUDA 12.9 |
 | CPU-only compiler | gfortran 12.4.0 (Ubuntu) |
@@ -60,8 +60,8 @@ This is O(ntot × natoms) — **~10.6 billion distance calculations** for the ZI
 - Each GPU thread processes one cubelet and loops over all atoms sequentially
 - Minimum-image distance is inlined for orthorhombic cells (the common case)
 - **Two-pass compaction** avoids GPU atomic operations:
-  1. GPU kernel marks valid cubelets in `g_valid/he_valid/n_valid` arrays
-  2. CPU compaction pass fills variable-length `g_cubes/he_cubes/n_cubes` arrays
+  1. GPU kernel marks valid cubelets by setting `lattice_space(j,k,l) = 1` directly in the grid
+  2. CPU compaction pass reads `lattice_space` to fill variable-length `g_cubes/he_cubes/n_cubes` arrays
 - Non-orthorhombic cells automatically fall back to CPU
 
 ### `surface_area_gpu` (reserved)
@@ -97,15 +97,17 @@ Test case: **ZIF8** (2208 atoms, 33.9864 Å cubic cell, 0.2 Å grid → 169³ = 
 
 | Version | Wall time | Speedup vs CPU |
 |---|---|---|
-| CPU (gfortran, 1 thread) | **178.4 s** | 1× (baseline) |
+| CPU (gfortran, 1 thread) | **177.7 s** | 1× (baseline) |
 | CPU (gfortran, 8 threads) | **179.1 s** | 1.0× (no OpenMP benefit) |
-| GPU (OpenACC, RTX 4000 Ada) | **23.7 s** | **7.5×** |
+| GPU (OpenACC, RTX 4000 Ada) | **24.0 s** | **7.4×** |
 
 > **Note:** The CPU code has only a single `!$omp atomic` directive, so adding threads provides no speedup. The GPU version is the first to provide real parallelism.
 
 ### Result Verification
 
-| Property | CPU Reference | GPU (fixed) | Status |
+All lattice-dependent properties are **bit-exact** between CPU and GPU versions. Surface area runs on CPU (see below), so it matches exactly too.
+
+| Property | CPU Reference | GPU (optimized) | Status |
 |---|---|---|---|
 | System volume, mass, density | — | **Same** | ✅ |
 | Pore Limiting Diameter (PLD) | 2.86 Å | **2.86 Å** | ✅ Exact |
@@ -115,20 +117,18 @@ Test case: **ZIF8** (2208 atoms, 33.9864 Å cubic cell, 0.2 Å grid → 169³ = 
 | Geometric volume (V_G) | 23565.30 Å³ | **23565.30 Å³** | ✅ Exact |
 | Total surface area (S_AC) | 4236.46 Å² | **4236.46 Å²** | ✅ Exact |
 | Free volume fraction (FV_PO) | 0.47735 | **0.47735** | ✅ Exact |
-| Probe-occupiable volume (V_PO) | 18739.13 Å³ | **18868.74 Å³** | ≈ 0.7%* |
-
-\* The 0.7% difference in probe-occupiable volume is due to Monte Carlo variance from a different RNG state at the start of `pore_distribution` (because the GPU version doesn't consume `rranf()` calls in `surface_area`).
+| Probe-occupiable volume (V_PO) | 18739.13 Å³ | **18739.13 Å³** | ✅ Exact |
 
 ### Performance Breakdown
 
-The 7.5× speedup comes almost entirely from `lattice_calculations`:
+The **7.4×** speedup comes almost entirely from `lattice_calculations`:
 
 | Component | CPU time | GPU time | Speedup |
 |---|---|---|---|
-| `lattice_calculations` | ~170 s (95%) | ~15 s | **~11×** |
+| `lattice_calculations` | ~168 s (95%) | ~14 s | **~12×** |
 | `surface_area` | ~8 s (5%) | ~8 s (CPU) | 1× (not GPU) |
 | Other (volumes, PSD, etc.) | ~1 s | ~1 s | 1× |
-| **Total** | **178 s** | **24 s** | **7.5×** |
+| **Total** | **177 s** | **24 s** | **7.4×** |
 
 The `surface_area` GPU version was disabled due to a Monte Carlo discrepancy. Re-enabling it would add marginal further speedup (~5% of total).
 
@@ -153,12 +153,26 @@ atom overlap loop (sequential)              ← reduction (deny/accept)
 
 ### Data Management
 
-The two-pass compaction pattern avoids GPU atomic operations:
+The GPU implementation uses a two-pass compaction pattern to avoid GPU atomic operations:
 
-1. **GPU pass**: `lattice_calculations_gpu` fills `g_valid(3D)`, `he_valid(3D)`, `n_valid(3D)` with linear cubelet indices for valid cubelets
-2. **CPU pass**: A compaction loop iterates over the 3D grid and fills `g_cubes(1D)`, `he_cubes(1D)`, `n_cubes(1D)` with valid entries
+1. **GPU pass**: `lattice_calculations_gpu` marks valid cubelets by setting `lattice_space(j,k,l) = 1` directly in the grid array
+2. **CPU pass**: A compaction loop iterates over the 3D grid, reading `lattice_space` to fill variable-length output arrays (`g_cubes`, `he_cubes`, `n_cubes`) with the linear indices of valid cubelets
 
-This requires 3 extra integer arrays (~3 × 4.8M × 4 bytes ≈ 55 MB for ZIF8) but eliminates the need for `!$acc atomic capture` in the hot loop.
+This avoids allocating separate `g_valid/he_valid/n_valid` arrays on the GPU, saving significant VRAM for large grids (~5.4 GB for a Large system-sized system with 228M cubelets).
+
+### Memory Optimization (Large system Fix)
+
+An initial version allocated `g_valid`, `he_valid`, `n_valid` (integer arrays the same size as `lattice_space`) and `lattice_index` (3 integer arrays) on the GPU. For large structures (Large system: 555×764×537 = 228M cubelets):
+
+| Array | Type | Size (GB) |
+|---|---|---|
+| `g_valid/he_valid/n_valid` | integer*4 × 3 | 2.74 |
+| `lattice_index(x3)` | integer*4 × 3 | 2.74 |
+| | **Total saved** | **5.48** |
+
+Removing these GPU allocations brought peak VRAM from ~10.6 GB down to ~5.1 GB, fitting comfortably in the RTX 4000 Ada's 12 GB. The CPU-side re-computation of `lattice_index` adds negligible overhead because it is only a single integer-increment loop.
+
+> **Large-structure OOM note**: Large system (18960 atoms, 0.1 Å grid) still fails on the **host** side — host arrays (`lattice_space` ×3, `lattice_rdist2`, `lattice_lj_he`) consume ~10.7 GB RAM, exceeding available system memory. The GPU run was killed by the host OOM killer (SIGTERM 143), not a GPU error. Workarounds: use a coarser grid (0.15–0.2 Å) or request more memory in a Slurm job.
 
 ### Random Number Generation
 
@@ -176,7 +190,7 @@ Each thread has its own seed derived from the atom index. The distribution was v
 |---|---|---|
 | `surface_area_gpu` discrepancy | Open | Unknown race condition or RNG interaction produces 2× higher ncount. Workaround: CPU fallback |
 | Non-orthorhombic cells | Handled | Falls back to CPU via `fcell%orthoflag` check |
-| Data re-upload between kernels | Suboptimal | `lattice_calculations_gpu` copies data back to host; `surface_area_gpu` re-uploads. Could keep data resident |
+| Surface data re-transfer after lattice calc | Suboptimal | `lattice_calculations_gpu` copies data back to host; `surface_area_gpu` re-uploads. Could keep data resident with `!$acc declare create` |
 | Percolation analysis | CPU only | `percolation_calc` runs on CPU. Small cost relative to total |
 | `pore_distribution` Monte Carlo | CPU only | Uses `rranf()` CPU RNG. Small cost |
 
