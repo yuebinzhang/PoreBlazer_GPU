@@ -1,0 +1,501 @@
+!--------------------------------------------------------------------------------------
+! GPU-accelerated subroutines for PoreBlazer v4.0
+! Uses OpenACC directives with NVIDIA HPC SDK (nvfortran)
+! Accelerates: lattice_calculations, surface_area, pore_distribution
+!--------------------------------------------------------------------------------------
+
+module verlet_mod
+    integer, allocatable :: vlist(:,:)
+    integer, allocatable :: nneighbors(:)
+    integer :: max_neighbors
+end module verlet_mod
+
+!--------------------------------------------------------------------------------------
+subroutine lattice_calculations_gpu
+    use parameters; use atoms; use adsorbent; use lattice; use defaults, only: rdbl
+    implicit none
+    real*8  :: ell(3)
+    logical :: ortho
+    integer :: i, j, k, l, icount
+    real*8  :: xc, yc, zc, d1, d2, d3, rdist2, rdist2_ref
+    real*8  :: rdist_surface, rdist_surface_ref, lj_local
+    real*8  :: sig2_rdist2, rdist6, rdist12, lj_energy
+    logical :: overlap; integer :: imin
+    integer :: ng, nhe, nn
+    integer*8 :: t1, t2, t_rate, t_max; real*8 :: elapsed
+
+    call system_clock(t1, t_rate, t_max)
+    write(*,*) "!-------------------------------------------------------!"
+    write(*,*) "! GPU-accelerated lattice calculations (OpenACC)         !"
+    write(*,*) "!-------------------------------------------------------!"; write(*,*)
+    ortho = fcell%orthoflag
+    if(.not. ortho) then
+        write(*,*) "  Non-orthorhombic cell detected — using CPU version"
+        call lattice_calculations; return
+    end if
+    ell = fcell%ell
+    lattice_space = 0; lattice_space_he = 0; lattice_space_n = 0
+    lattice_rdist2 = 0.0d0; lattice_lj_he = 0.0d0
+    g_cubes = 0; he_cubes = 0; n_cubes = 0
+
+    !$acc enter data copyin(coords_temp, asigma2, asigma2_he, aeps_he, &
+    !$acc&   asigma, asigma2_n, atype, ell, hicut2, cube_size, &
+    !$acc&   ncubesx, ncubesy, ncubesz, natoms) &
+    !$acc&   create(lattice_space, lattice_rdist2, lattice_space_he, &
+    !$acc&   lattice_space_n, lattice_lj_he)
+
+    !$acc parallel loop collapse(3) gang vector_length(64) &
+    !$acc& private(xc, yc, zc, d1, d2, d3, rdist2, rdist2_ref, overlap, &
+    !$acc&   rdist_surface, rdist_surface_ref, imin, lj_local, &
+    !$acc&   sig2_rdist2, rdist6, rdist12, lj_energy) &
+    !$acc& firstprivate(ell, cube_size, hicut2) &
+    !$acc& present(coords_temp, asigma2, asigma2_he, aeps_he, asigma, &
+    !$acc&   asigma2_n, atype, lattice_space, lattice_rdist2, &
+    !$acc&   lattice_space_he, lattice_space_n, lattice_lj_he, &
+    !$acc&   ncubesx, ncubesy, ncubesz)
+    do l=1, ncubesz
+        do k=1, ncubesy
+            do j=1, ncubesx
+                xc = dble(j-1)*cube_size + 0.5d0*cube_size
+                yc = dble(k-1)*cube_size + 0.5d0*cube_size
+                zc = dble(l-1)*cube_size + 0.5d0*cube_size
+                overlap = .false.; rdist2_ref = huge(0.0d0)
+                rdist_surface_ref = huge(0.0d0); lj_local = 0.0d0; imin = 1
+                do i=1, natoms
+                    d1 = xc - coords_temp(1, i)
+                    d2 = yc - coords_temp(2, i)
+                    d3 = zc - coords_temp(3, i)
+                    d1 = d1 - ell(1)*anint(d1/ell(1))
+                    d2 = d2 - ell(2)*anint(d2/ell(2))
+                    d3 = d3 - ell(3)*anint(d3/ell(3))
+                    rdist2 = d1*d1 + d2*d2 + d3*d3
+                    if(rdist2 < 0.25d0*asigma2(atype(i))) then
+                        overlap = .true.; exit
+                    end if
+                    if(rdist2 < rdist2_ref) then
+                        rdist2_ref = rdist2; imin = i
+                    end if
+                    rdist_surface = dsqrt(rdist2) - 0.5d0*asigma(atype(i))
+                    if(rdist_surface < rdist_surface_ref) rdist_surface_ref = rdist_surface
+                    if(rdist2 < hicut2) then
+                        sig2_rdist2 = asigma2_he(atype(i))/rdist2
+                        rdist6 = sig2_rdist2*sig2_rdist2*sig2_rdist2
+                        rdist12 = rdist6*rdist6
+                        lj_energy = aeps_he(atype(i))*(rdist12 - rdist6)
+                        lj_local = lj_local + lj_energy
+                    end if
+                end do
+                icount = (l-1)*ncubesx*ncubesy + (k-1)*ncubesx + j
+                lattice_lj_he(icount) = lj_local
+                if(overlap) cycle
+                lattice_space(j,k,l) = 1
+                lattice_rdist2(j,k,l) = rdist_surface_ref*rdist_surface_ref
+                if(rdist2_ref > 0.25d0*asigma2_he(atype(imin))) lattice_space_he(j,k,l) = 1
+                if(rdist2_ref > asigma2_n(atype(imin))) lattice_space_n(j,k,l) = 1
+            end do
+        end do
+    end do
+    !$acc end parallel loop
+
+    !$acc exit data copyout(lattice_space, lattice_rdist2, lattice_space_he, &
+    !$acc&   lattice_space_n, lattice_lj_he)
+
+    call system_clock(t2)
+    elapsed = dble(t2-t1)/dble(t_rate)
+    write(*,'(a,f8.2,a)') "  [TIMING] Lattice kernel took ", elapsed, " seconds"
+
+    ng = 0; nhe = 0; nn = 0
+    do l=1, ncubesz
+        do k=1, ncubesy
+            do j=1, ncubesx
+                icount = (l-1)*ncubesx*ncubesy + (k-1)*ncubesx + j
+                if(lattice_space(j,k,l) == 1) then; ng = ng + 1; g_cubes(ng) = icount; end if
+                if(lattice_space_he(j,k,l) == 1) then; nhe = nhe + 1; he_cubes(nhe) = icount; end if
+                if(lattice_space_n(j,k,l) == 1) then; nn = nn + 1; n_cubes(nn) = icount; end if
+            end do
+        end do
+    end do
+    ng_cubes = ng; nhe_cubes = nhe; nn_cubes = nn
+    do icount = 1, ntot
+        l = (icount - 1) / (ncubesx * ncubesy) + 1
+        k = modulo((icount - 1) / ncubesx, ncubesy) + 1
+        j = modulo(icount - 1, ncubesx) + 1
+        lattice_index(1, icount) = j; lattice_index(2, icount) = k; lattice_index(3, icount) = l
+    end do
+    allocate(PA1(ng_cubes), PA2(ng_cubes), PA3(ng_cubes), PA4(ng_cubes))
+    PA1 = 0.0d0; PA2 = 0; PA3 = 0; PA4 = 0
+    write(*,'(a,i10)') "  Cubelets accessible to point probe:  ", ng_cubes
+    write(*,'(a,i10)') "  Cubelets accessible to helium:       ", nhe_cubes
+    write(*,'(a,i10)') "  Cubelets accessible to nitrogen:     ", nn_cubes
+    write(*,*); write(*,*) "!-------------------------------------------------------!"
+    write(*,*) "! GPU lattice calculations complete                      !"
+    write(*,*) "!-------------------------------------------------------!"; write(*,*)
+    return
+end subroutine lattice_calculations_gpu
+
+!--------------------------------------------------------------------------------------
+subroutine build_verlet_list
+    use parameters; use atoms; use adsorbent; use verlet_mod
+    implicit none
+    real*8 :: max_sigma_n, rmax, rmax2, d1, d2, d3, rdist2
+    integer :: i, k
+    write(*,*) "  Building Verlet neighbor list..."
+    max_sigma_n = maxval(asigma_n)
+    rmax = coeff_surface * 2.0d0 * max_sigma_n; rmax2 = rmax * rmax
+    if(.not. allocated(nneighbors)) allocate(nneighbors(natoms))
+    nneighbors = 0
+    do i = 1, natoms
+        do k = 1, natoms
+            if(k == i) cycle
+            d1 = coords(1,i) - coords(1,k); d2 = coords(2,i) - coords(2,k)
+            d3 = coords(3,i) - coords(3,k)
+            d1 = d1 - fcell%ell(1)*anint(d1/fcell%ell(1))
+            d2 = d2 - fcell%ell(2)*anint(d2/fcell%ell(2))
+            d3 = d3 - fcell%ell(3)*anint(d3/fcell%ell(3))
+            rdist2 = d1*d1 + d2*d2 + d3*d3
+            if(rdist2 < rmax2) nneighbors(i) = nneighbors(i) + 1
+        end do
+    end do
+    max_neighbors = maxval(nneighbors)
+    if(allocated(vlist)) deallocate(vlist)
+    allocate(vlist(natoms, max_neighbors)); vlist = 0
+    nneighbors = 0
+    do i = 1, natoms
+        do k = 1, natoms
+            if(k == i) cycle
+            d1 = coords(1,i) - coords(1,k); d2 = coords(2,i) - coords(2,k)
+            d3 = coords(3,i) - coords(3,k)
+            d1 = d1 - fcell%ell(1)*anint(d1/fcell%ell(1))
+            d2 = d2 - fcell%ell(2)*anint(d2/fcell%ell(2))
+            d3 = d3 - fcell%ell(3)*anint(d3/fcell%ell(3))
+            rdist2 = d1*d1 + d2*d2 + d3*d3
+            if(rdist2 < rmax2) then
+                nneighbors(i) = nneighbors(i) + 1; vlist(i, nneighbors(i)) = k
+            end if
+        end do
+    end do
+    write(*,'(a,i6,a,i4)') "  Verlet: max neighbors = ", max_neighbors, &
+        "  (avg = ", nint(sum(dble(nneighbors))/natoms), ")"
+end subroutine build_verlet_list
+
+!--------------------------------------------------------------------------------------
+subroutine surface_area_gpu
+    use parameters; use atoms; use adsorbent; use lattice
+    use defaults, only: rdbl, pi; use results; use verlet_mod
+    implicit none
+    real*8  :: ell(3), hcut2_loc
+    integer :: i, j, k, n, nx, ny, nz
+    real*8  :: phi, costheta, theta, rdist2, sfrac, sjreal, stotalreduced, vol
+    real*8  :: d1, d2, d3, xp, yp, zp, rn
+    logical :: deny, ortho
+    integer*8 :: seed, new_seed
+    integer, allocatable :: ncount_arr(:)
+    integer*8 :: t1, t2, t_rate, t_max; real*8 :: elapsed
+
+    call system_clock(t1, t_rate, t_max)
+    write(*,*) "!-------------------------------------------------------!"
+    write(*,*) "! GPU-accelerated surface area (OpenACC)                 !"
+    write(*,*) "!-------------------------------------------------------!"; write(*,*)
+    ortho = fcell%orthoflag
+    if(.not. ortho) then; write(*,*) "  Non-ortho — using CPU"; call surface_area; return; end if
+    if(nn_cubes == 0) then
+        stotal = 0.0d0; vol = fundcell_getvolume(fcell)
+        stotalreduced = stotal/(vol)*1.0d4
+        write(*,'(2a,f12.2)') " "//Trim(adjustl(property)), ' surface area in A^2: ', stotal
+        write(100,*) property; write(100,'(a,f12.2)') "S_AC_A^2 ", stotal; return
+    end if
+    ell = fcell%ell; hcut2_loc = hicut2
+    allocate(ncount_arr(natoms)); ncount_arr = 0
+    call build_verlet_list
+
+    !$acc enter data create(ncount_arr)
+    !$acc enter data copyin(coords, asigma_n, asigma2_n, atype, ell, &
+    !$acc&   lattice_space_n, vlist, nneighbors, max_neighbors)
+
+    !$acc parallel loop gang vector_length(128) &
+    !$acc& private(j, k, n, phi, costheta, theta, xp, yp, zp, d1, d2, d3, &
+    !$acc&   rdist2, deny, nx, ny, nz, seed, new_seed, rn) &
+    !$acc& firstprivate(ell, coeff_surface, coeff_surface2, cube_size, &
+    !$acc&   natoms, nsample, ncubesx, ncubesy, ncubesz) &
+    !$acc& present(coords, asigma_n, asigma2_n, atype, ncount_arr, &
+    !$acc&   lattice_space_n, vlist, nneighbors)
+    do i=1, natoms
+        seed = 1_8 + i * 694847539_8; ncount_arr(i) = 0
+        do j=1, nsample
+            new_seed = mod(1664525_8 * seed + 1013904223_8, 2147483647_8)
+            seed = new_seed; rn = dble(seed) / 2147483647.0d0
+            phi = pi - rn * 2.0d0 * pi
+            new_seed = mod(1664525_8 * seed + 1013904223_8, 2147483647_8)
+            seed = new_seed; rn = dble(seed) / 2147483647.0d0
+            costheta = 1.0d0 - rn * 2.0d0
+            if(costheta > 1.0d0) costheta = 1.0d0
+            if(costheta < -1.0d0) costheta = -1.0d0
+            theta = acos(costheta)
+            xp = sin(theta)*cos(phi)*(coeff_surface*asigma_n(atype(i))) + coords(1,i)
+            yp = sin(theta)*sin(phi)*(coeff_surface*asigma_n(atype(i))) + coords(2,i)
+            zp = costheta*(coeff_surface*asigma_n(atype(i))) + coords(3,i)
+            d1 = xp - ell(1)*anint(xp/ell(1)); d2 = yp - ell(2)*anint(yp/ell(2))
+            d3 = zp - ell(3)*anint(zp/ell(3))
+            if(d1 < 0.0d0) d1 = d1 + ell(1); if(d1 >= ell(1)) d1 = d1 - ell(1)
+            if(d2 < 0.0d0) d2 = d2 + ell(2); if(d2 >= ell(2)) d2 = d2 - ell(2)
+            if(d3 < 0.0d0) d3 = d3 + ell(3); if(d3 >= ell(3)) d3 = d3 - ell(3)
+            xp = d1; yp = d2; zp = d3
+            nx = int(xp/cube_size)+1; ny = int(yp/cube_size)+1; nz = int(zp/cube_size)+1
+            if(nx > ncubesx) nx = nx - (nx/ncubesx)*ncubesx; if(nx < 1) nx = nx + (1-(nx/ncubesx))*ncubesx
+            if(ny > ncubesy) ny = ny - (ny/ncubesy)*ncubesy; if(ny < 1) ny = ny + (1-(ny/ncubesy))*ncubesy
+            if(nz > ncubesz) nz = nz - (nz/ncubesz)*ncubesz; if(nz < 1) nz = nz + (1-(nz/ncubesz))*ncubesz
+            if(lattice_space_n(nx,ny,nz) < 1) cycle
+            deny = .false.
+            do n=1, nneighbors(i)
+                k = vlist(i,n)
+                d1 = xp - coords(1,k); d2 = yp - coords(2,k); d3 = zp - coords(3,k)
+                d1 = d1 - ell(1)*anint(d1/ell(1)); d2 = d2 - ell(2)*anint(d2/ell(2))
+                d3 = d3 - ell(3)*anint(d3/ell(3))
+                rdist2 = d1*d1 + d2*d2 + d3*d3
+                if(rdist2 < coeff_surface2 * asigma2_n(atype(k))) then; deny = .true.; exit; end if
+            end do
+            if(deny) cycle
+            ncount_arr(i) = ncount_arr(i) + 1
+        end do
+    end do
+    !$acc end parallel loop
+    !$acc exit data copyout(ncount_arr)
+
+    stotal = 0.0d0
+    do i=1, natoms
+        if(ncount_arr(i) > 0) then
+            sfrac = dble(ncount_arr(i))/dble(nsample)
+            sjreal = 4.0d0*pi*coeff_surface2*asigma2_n(atype(i))*sfrac
+            stotal = stotal + sjreal
+        end if
+    end do
+    deallocate(ncount_arr)
+    vol = fundcell_getvolume(fcell); stotalreduced = stotal/(vol)*1.0d4
+    call system_clock(t2); elapsed = dble(t2-t1)/dble(t_rate)
+    write(*,'(a,f8.3,a)') "  [TIMING] Surface area GPU took ", elapsed, " seconds"
+    write(*,'(2a,f12.2)') " "//Trim(adjustl(property)), ' surface area in A^2: ', stotal
+    write(100,*) property; write(100,'(a,f12.2)') "S_AC_A^2 ", stotal
+    return
+end subroutine surface_area_gpu
+
+!--------------------------------------------------------------------------------------
+! GPU-accelerated PSD Monte Carlo
+! Uses local array copies to avoid OpenACC module-level allocatable issues.
+! PA search uses simple distance (no PBC) — both points in same unit cell.
+!--------------------------------------------------------------------------------------
+subroutine pore_distribution_gpu
+    use parameters; use atoms; use adsorbent; use lattice
+    use distributions; use results
+    use fundcell, only: fundcell_getvolume
+    use defaults, only: rdbl
+    implicit none
+    real*8, allocatable  :: lcl_PA1(:)
+    integer, allocatable :: lcl_PA2(:), lcl_PA3(:), lcl_PA4(:)
+    integer, allocatable :: lcl_g_cubes(:), lcl_n_cubes(:)
+    real*4, allocatable  :: lcl_psd_cumul(:)
+    integer :: i, j, k, l, m, bin, nc_local, isite, ncycles, ivis, icount
+    integer :: nx, ny, nz, nx1, ny1, nz1
+    real*8  :: sigma2_ref, sigma_ref, rdist2, d1, d2, d3
+    real*8  :: xc, yc, zc, xc1, yc1, zc1, rn
+    real*8  :: ellx, elly, ellz
+    integer*8 :: seed, new_seed
+    integer*8 :: t1, t2, t_rate, t_max; real*8 :: elapsed
+
+    call system_clock(t1, t_rate, t_max)
+    write(*,*) "!-------------------------------------------------------!"
+    write(*,*) "! Starting GPU-accelerated PSD calculations (OpenACC)    !"
+    write(*,*) "!-------------------------------------------------------!"; write(*,*)
+    if(ng_cubes == 0) then; write(*,*) "  No accessible porosity — skipping PSD"; return; end if
+
+    ncycles = ncycles_psd; ivis = 0
+    if(property == "Total ") then
+        do l=1, ncubesz; do k=1, ncubesy; do j=1, ncubesx
+            if(lattice_space(j,k,l) < 1) cycle
+            ivis = ivis + 1; PA1(ivis) = lattice_rdist2(j,k,l)
+            PA2(ivis) = j; PA3(ivis) = k; PA4(ivis) = l
+        end do; end do; end do
+        call sort(ng_cubes, PA1, PA2, PA3, PA4); nc_local = ng_cubes
+    else
+        do l=1, ncubesz; do k=1, ncubesy; do j=1, ncubesx
+            if(lattice_space_n(j,k,l) < 1) cycle
+            ivis = ivis + 1; PA1(ivis) = lattice_rdist2(j,k,l)
+            PA2(ivis) = j; PA3(ivis) = k; PA4(ivis) = l
+        end do; end do; end do
+        call sort(nn_cubes, PA1, PA2, PA3, PA4); nc_local = nn_cubes
+    end if
+    if(nc_local == 0) then; write(*,*) "  No accessible cubelets"; psd_cumul=0.0; psd=0.0; return; end if
+
+    ! Cell dimensions for minimum-image PBC
+    ellx = fcell%ell(1); elly = fcell%ell(2); ellz = fcell%ell(3)
+
+    allocate(lcl_PA1(nc_local), source=PA1(1:nc_local))
+    allocate(lcl_PA2(nc_local), source=PA2(1:nc_local))
+    allocate(lcl_PA3(nc_local), source=PA3(1:nc_local))
+    allocate(lcl_PA4(nc_local), source=PA4(1:nc_local))
+    if(property == "Total ") then
+        allocate(lcl_g_cubes(ng_cubes), source=g_cubes(1:ng_cubes))
+    else
+        allocate(lcl_n_cubes(nn_cubes), source=n_cubes(1:nn_cubes))
+    end if
+    allocate(lcl_psd_cumul(nbins+100)); lcl_psd_cumul = 0.0
+    write(*,'(a,i10,a,i5)') "  PSD: nc_local=", nc_local, " ncycles=", ncycles
+
+    ! Total PSD branch
+    if(property == "Total ") then
+        !$acc enter data copyin(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4) &
+        !$acc& create(lcl_psd_cumul)
+        !$acc enter data copyin(lcl_g_cubes)
+        !$acc parallel loop gang vector_length(32) &
+        !$acc& private(isite, nx, ny, nz, nx1, ny1, nz1, icount, &
+        !$acc&   sigma2_ref, sigma_ref, rdist2, d1, d2, d3, &
+        !$acc&   xc, yc, zc, xc1, yc1, zc1, m, bin, rn, seed, new_seed) &
+        !$acc& firstprivate(ncycles, nc_local, ng_cubes, &
+        !$acc&   cube_size, nbins, ncubesx, ncubesy, ncubesz, ellx, elly, ellz) &
+        !$acc& present(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4, lcl_psd_cumul, lcl_g_cubes)
+        do i = 1, ncycles
+            sigma2_ref = 0.0d0; seed = 1_8 + i * 694847539_8
+            new_seed = mod(1664525_8 * seed + 1013904223_8, 2147483647_8)
+            seed = new_seed; rn = dble(seed) / 2147483647.0d0
+            isite = int(rn * dble(ng_cubes)) + 1; if(isite > ng_cubes) isite = ng_cubes
+            icount = lcl_g_cubes(isite)
+            nz = (icount-1)/(ncubesx*ncubesy)+1; ny = modulo((icount-1)/ncubesx,ncubesy)+1
+            nx = modulo(icount-1,ncubesx)+1
+            xc = dble(nx-1)*cube_size+0.5d0*cube_size
+            yc = dble(ny-1)*cube_size+0.5d0*cube_size
+            zc = dble(nz-1)*cube_size+0.5d0*cube_size
+            do m = nc_local, 1, -1
+                nx1 = lcl_PA2(m); ny1 = lcl_PA3(m); nz1 = lcl_PA4(m)
+                xc1 = dble(nx1-1)*cube_size+0.5d0*cube_size
+                yc1 = dble(ny1-1)*cube_size+0.5d0*cube_size
+                zc1 = dble(nz1-1)*cube_size+0.5d0*cube_size
+                d1 = xc - xc1; d2 = yc - yc1; d3 = zc - zc1
+                ! Minimum-image PBC (match fundcell_snglminimage for ortho cells)
+                d1 = d1 - ellx*anint(d1/ellx)
+                d2 = d2 - elly*anint(d2/elly)
+                d3 = d3 - ellz*anint(d3/ellz)
+                rdist2 = d1*d1 + d2*d2 + d3*d3
+                if(rdist2 > lcl_PA1(m)) then; cycle
+                else
+                    sigma2_ref = lcl_PA1(m); sigma_ref = sqrt(sigma2_ref)
+                    bin = int(2.0d0*sigma_ref/binsize) + 1
+                    if(bin > nbins+100) bin = nbins+100; if(bin < 1) bin = 1
+                    !$acc atomic update
+                    lcl_psd_cumul(bin) = lcl_psd_cumul(bin) + 1.0; exit
+                end if
+            end do
+        end do
+        !$acc end parallel loop
+        !$acc update host(lcl_psd_cumul)
+        !$acc exit data delete(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4, lcl_psd_cumul, lcl_g_cubes)
+
+    ! Network-accessible PSD branch
+    else
+        !$acc enter data copyin(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4) &
+        !$acc& create(lcl_psd_cumul)
+        !$acc enter data copyin(lcl_n_cubes)
+        !$acc parallel loop gang vector_length(32) &
+        !$acc& private(isite, nx, ny, nz, nx1, ny1, nz1, icount, &
+        !$acc&   sigma2_ref, sigma_ref, rdist2, d1, d2, d3, &
+        !$acc&   xc, yc, zc, xc1, yc1, zc1, m, bin, rn, seed, new_seed) &
+        !$acc& firstprivate(ncycles, nc_local, nn_cubes, &
+        !$acc&   cube_size, nbins, ncubesx, ncubesy, ncubesz, ellx, elly, ellz) &
+        !$acc& present(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4, lcl_psd_cumul, lcl_n_cubes)
+        do i = 1, ncycles
+            if(nn_cubes == 0) cycle
+            sigma2_ref = 0.0d0; seed = 1_8 + i * 694847539_8
+            new_seed = mod(1664525_8 * seed + 1013904223_8, 2147483647_8)
+            seed = new_seed; rn = dble(seed) / 2147483647.0d0
+            isite = int(rn * dble(nn_cubes)) + 1; if(isite > nn_cubes) isite = nn_cubes
+            icount = lcl_n_cubes(isite)
+            nz = (icount-1)/(ncubesx*ncubesy)+1; ny = modulo((icount-1)/ncubesx,ncubesy)+1
+            nx = modulo(icount-1,ncubesx)+1
+            xc = dble(nx-1)*cube_size+0.5d0*cube_size
+            yc = dble(ny-1)*cube_size+0.5d0*cube_size
+            zc = dble(nz-1)*cube_size+0.5d0*cube_size
+            do m = nc_local, 1, -1
+                nx1 = lcl_PA2(m); ny1 = lcl_PA3(m); nz1 = lcl_PA4(m)
+                xc1 = dble(nx1-1)*cube_size+0.5d0*cube_size
+                yc1 = dble(ny1-1)*cube_size+0.5d0*cube_size
+                zc1 = dble(nz1-1)*cube_size+0.5d0*cube_size
+                d1 = xc - xc1; d2 = yc - yc1; d3 = zc - zc1
+                ! Minimum-image PBC (match fundcell_snglminimage for ortho cells)
+                d1 = d1 - ellx*anint(d1/ellx)
+                d2 = d2 - elly*anint(d2/elly)
+                d3 = d3 - ellz*anint(d3/ellz)
+                rdist2 = d1*d1 + d2*d2 + d3*d3
+                if(rdist2 > lcl_PA1(m)) then; cycle
+                else
+                    sigma2_ref = lcl_PA1(m); sigma_ref = sqrt(sigma2_ref)
+                    bin = int(2.0d0*sigma_ref/binsize) + 1
+                    if(bin > nbins+100) bin = nbins+100; if(bin < 1) bin = 1
+                    !$acc atomic update
+                    lcl_psd_cumul(bin) = lcl_psd_cumul(bin) + 1.0; exit
+                end if
+            end do
+        end do
+        !$acc end parallel loop
+        !$acc update host(lcl_psd_cumul)
+        !$acc exit data delete(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4, lcl_psd_cumul, lcl_n_cubes)
+    end if
+
+    ! Build cumulative histogram from host copy
+    do bin = nbins+99, 1, -1; lcl_psd_cumul(bin) = lcl_psd_cumul(bin) + lcl_psd_cumul(bin+1); end do
+    psd_cumul = lcl_psd_cumul
+    if(psd_cumul(1) > 0.0) then; ffv = psd_cumul(1) / real(ncycles)
+    else; ffv = 0.0; end if
+    if(property == "Total ") then; ffv = ffv * dble(ng_cubes) / dble(ntot)
+    else; ffv = ffv * dble(nn_cubes) / dble(ntot); end if
+    free_volume = ffv * fundcell_getvolume(fcell)
+
+    call write_psd_output
+    call system_clock(t2); elapsed = dble(t2-t1)/dble(t_rate)
+    write(*,'(a,f8.3,a)') "  [TIMING] PSD GPU took ", elapsed, " seconds"
+    deallocate(lcl_PA1, lcl_PA2, lcl_PA3, lcl_PA4, lcl_psd_cumul)
+    if(allocated(lcl_g_cubes)) deallocate(lcl_g_cubes)
+    if(allocated(lcl_n_cubes)) deallocate(lcl_n_cubes)
+    return
+end subroutine pore_distribution_gpu
+
+!--------------------------------------------------------------------------------------
+subroutine write_psd_output
+    use parameters; use lattice; use distributions; use results
+    use fundcell, only: fundcell_getvolume; use defaults, only: rdbl
+    implicit none
+    integer :: i; real*8 :: deldis1, deldis2, deldis
+    open(13, file=Trim(adjustl(property))//'_psd_cumulative.txt', status='unknown')
+    open(14, file=Trim(adjustl(property))//'_psd.txt', status='unknown')
+    write(13,*) '# Cumulative accessible volume distribution as a function of probe diameter'
+    write(13,*) '# '; write(13,*) '# d(probe)                Volume Fraction'
+    if(psd_cumul(1) > 0.0) psd_cumul = psd_cumul / psd_cumul(1)
+    do i=1, nbins; write(13,*) binsize*real(i-1)-binsize/2.0, psd_cumul(i); end do
+    psd(1)=0.0; psd(2)=0.0; psd(nbins)=0.0
+    do i=2, nbins-1
+        deldis1=psd_cumul(i+1); deldis2=psd_cumul(i-1); deldis=deldis1-deldis2
+        psd(i)=-1.0*(deldis)/(binsize*2.0)
+    end do
+    write(14,*) '# Derivative distribution function -dV(r)/dr (or -dV(d)/dd) vs d'
+    do i=2, nbins-1; write(14,*) binsize*real(i-1)-binsize/2.0, psd(i); end do
+    close(13); close(14)
+    open(20, file="probe_occupiable_volume.xyz", status="unknown")
+    write(20,*) 0; write(20,*); close(20)
+    write(*,*) Trim(adjustl(property)), " cumulative PSD and differential"
+    write(*,*) "PSD have been stored in files ", Trim(adjustl(property))//"_psd_cumulative.txt"
+    write(*,*) "and ", Trim(adjustl(property))//"_ psd.txt"
+    write(*,*); write(*,*) "!-------------------------------------------------------!"
+    write(*,*) "! Pore size distribution calculations complete          !"
+    write(*,*) "!-------------------------------------------------------!"; write(*,*)
+    return
+end subroutine write_psd_output
+
+!--------------------------------------------------------------------------------------
+function gpu_rand(seed) result(r)
+    implicit none; !$acc routine vector
+    integer, intent(inout) :: seed; real*8  :: r; integer :: new_seed
+    new_seed = 1664525 * seed + 1013904223
+    if(new_seed < 0) new_seed = new_seed + 2147483647
+    seed = mod(new_seed, 2147483647)
+    if(seed < 0) seed = seed + 2147483647
+    r = dble(seed) / 2147483647.0d0
+    if(r < 0.0d0) r = 0.0d0; if(r >= 1.0d0) r = 0.9999999999d0
+    return
+end function gpu_rand

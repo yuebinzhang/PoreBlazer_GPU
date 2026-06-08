@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH --job-name=PB_compile
+#SBATCH --partition=cluster
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH -e compile.err
+#SBATCH -o compile.log
+#SBATCH --gres=gpu:1
+#SBATCH --mem=4GB
+
+export PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/2026/compilers/bin:/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/opt/nvidia/hpc_sdk/Linux_x86_64/2026/compilers/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+cd /home/bird/HWS_job/Martini_job/PoreBlazer_GPU/PoreBlazer-main/src
+make clean
+make -e FORTRAN_COMPILER=nvfortran gpu 2>&1
+echo "---"
+ls -la poreblazer_gpu.exe

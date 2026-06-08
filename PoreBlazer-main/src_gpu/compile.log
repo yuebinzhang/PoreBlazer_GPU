@@ -1,0 +1,49 @@
+/bin/rm -f *.o *.i *.mod a.out make.log
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c defaults.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c percolation.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c utils.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c matrixops.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c random.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c vector.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c matrix.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c fundcell.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c poreblazer.f90
+nvfortran -cpp    -O3 -fast -acc -gpu=cc89 -Minfo=accel -DUSE_GPU -c poreblazer_gpu.f90
+lattice_calculations_gpu:
+     83, Generating enter data copyin(hicut2)
+         Generating enter data create(lattice_space_he(:,:,:),lattice_space(:,:,:),lattice_lj_he(:),lattice_rdist2(:,:,:),lattice_space_n(:,:,:))
+         Generating enter data copyin(ncubesy,ncubesz,ncubesx,natoms,coords_temp(:,:),ell(:),cube_size,asigma2_n(:),asigma2_he(:),aeps_he(:),asigma2(:),asigma(:),atype(:))
+     89, Generating present(atype(:),asigma(:),asigma2(:),aeps_he(:),asigma2_he(:),asigma2_n(:),lattice_rdist2(:,:,:),lattice_lj_he(:),lattice_space(:,:,:),lattice_space_he(:,:,:),coords_temp(:,:),lattice_space_n(:,:,:),ncubesx,ncubesz,ncubesy)
+         Generating implicit firstprivate(natoms)
+         Generating NVIDIA GPU code
+         98, !$acc loop gang, vector(128) collapse(3) ! blockidx%x threadidx%x
+         99,   ! blockidx%x threadidx%x collapsed
+        100,   ! blockidx%x threadidx%x collapsed
+     89, Local memory used for ell
+         Generating update device(ell(:))
+    100, Generating implicit firstprivate(icount,i)
+    115, Loop carried scalar dependence for rdist2_ref at line 132
+         Scalar last value needed after loop for rdist2_ref at line 165,170
+    182, Generating exit data copyout(lattice_space_n(:,:,:),lattice_space_he(:,:,:),lattice_space(:,:,:),lattice_lj_he(:),lattice_rdist2(:,:,:))
+surface_area_gpu:
+    335, Generating enter data copyin(natoms,ncubesz,nsample,lattice_space_n(:,:,:),ncubesy,ncubesx)
+         Generating enter data create(ncount_arr(:))
+         Generating enter data copyin(ell(:),coords(:,:),coeff_surface,atype(:),cube_size,asigma_n(:),asigma2_n(:),coeff_surface2)
+    340, Generating present(atype(:),asigma2_n(:),asigma_n(:),ncount_arr(:),lattice_space_n(:,:,:),coords(:,:))
+         Generating NVIDIA GPU code
+        347, !$acc loop gang, vector(128) ! blockidx%x threadidx%x
+        352, !$acc loop seq
+    340, Local memory used for ell
+         Generating update device(ell(:))
+    352, Loop carried scalar dependence for seed at line 354
+         Complex loop carried dependence of ncount_arr prevents parallelization
+         Loop carried reuse of ncount_arr prevents parallelization
+         Generating implicit firstprivate(k)
+         Complex loop carried dependence of ncount_arr prevents parallelization
+         Loop carried reuse of ncount_arr prevents parallelization
+    432, Generating exit data copyout(ncount_arr(:))
+gpu_rand:
+    480, Generating NVIDIA GPU code
+nvfortran  -O3 -fast -acc -gpu=cc89 -Minfo=accel -acc -gpu=cc89 defaults.o percolation.o utils.o matrixops.o random.o vector.o fundcell.o matrix.o poreblazer.o poreblazer_gpu.o -o poreblazer_gpu.exe
+---
+-rwxrwxr-x 1 bird bird 580544  6月  5 15:03 poreblazer_gpu.exe
